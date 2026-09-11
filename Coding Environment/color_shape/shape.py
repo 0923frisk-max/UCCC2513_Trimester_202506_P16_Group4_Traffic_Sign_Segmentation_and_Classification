@@ -1,4 +1,3 @@
-#Code Sample 4 [Done by: Lee Jun Xian]
 import cv2
 import numpy as np
 import os

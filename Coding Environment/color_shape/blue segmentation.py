@@ -1,4 +1,3 @@
-#Code Sample 2 [done by Christopher Yong Wen Jie]
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt

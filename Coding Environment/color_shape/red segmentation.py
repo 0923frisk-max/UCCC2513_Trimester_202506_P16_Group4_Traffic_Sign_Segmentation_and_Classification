@@ -1,6 +1,4 @@
-#Code Sample 1 [done by Jonathan Koo Hau Chung]
-#below is made from Gemini's code
-#define directory path of images
+
 from pathlib import Path
 
 input_dir=Path(r"C:/Users/jonat/OneDrive/Desktop/degree/y2s2/mini project/images/Inputs/Red signs")

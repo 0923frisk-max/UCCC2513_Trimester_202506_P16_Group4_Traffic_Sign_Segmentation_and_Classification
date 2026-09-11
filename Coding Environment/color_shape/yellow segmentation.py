@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import math
 
-
 def get_images_from_directory(path="./Inputs/Yellow Signs"):
     """Reads all supported image files from a given directory."""
     dir_path = Path(path)
