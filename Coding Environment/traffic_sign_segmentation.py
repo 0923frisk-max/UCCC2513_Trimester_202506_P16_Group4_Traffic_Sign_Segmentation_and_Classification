@@ -50,7 +50,9 @@ Usage
         show=True,
     )
     # results is a list of dicts:
-    #   {"filename": str, "original": np.ndarray (RGB), "cropped": np.ndarray (RGB)}
+    #   {"filename": str, "original": np.ndarray (RGB), "cropped": np.ndarray (RGB),
+    #    "status": "ok" | "fallback",
+    #    "hog": np.ndarray, "color_histogram": np.ndarray, "hog_color": np.ndarray}
 """
 
 import math
@@ -61,6 +63,10 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
+
+import feature_extraction_one as feat1
+import feature_extraction_two as feat2
+
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 COLORS = ["Blue", "Red", "Yellow"]
 
@@ -68,8 +74,13 @@ COLORS = ["Blue", "Red", "Yellow"]
 class TrafficSignSegmenter:
     """Color + shape based segmenter, robust to lighting and noise."""
 
-    def __init__(self, resize_to=(300, 300)):
+    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05):
         self.resize_to = resize_to
+        # If the final mask covers less than this fraction of the frame,
+        # the "detected" region is treated as too small/unreliable and we
+        # fall back to returning the (resized) original image instead of
+        # a crop that is probably noise, not signal.
+        self.min_mask_area_ratio = min_mask_area_ratio
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
 
@@ -213,23 +224,44 @@ class TrafficSignSegmenter:
     def segment(self, bgr_image, color_name):
         """Segment a single BGR image for the given color.
 
-        Returns (rgb_original, cropped_rgb, mask, success_bool).
-        On failure, cropped_rgb is an all-black image of the same size.
+        Returns (rgb_original, cropped_rgb, mask, status) where status is
+        one of:
+            "ok"       — a reliable sign region was found and cropped
+            "fallback" — no reliable region (mask too small / not found);
+                         cropped_rgb is the resized ORIGINAL image, and
+                         mask is left as an all-white mask of the same
+                         size (so downstream code can still treat
+                         "cropped" uniformly as "the RGB image to use").
+
+        A fallback is used instead of discarding the image so the sample
+        isn't lost from the dataset — it just isn't trimmed down to a
+        (likely wrong) tiny region.
         """
         if self.resize_to is not None:
             bgr_image = cv2.resize(bgr_image, self.resize_to)
 
         rgb_original = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        frame_area = rgb_original.shape[0] * rgb_original.shape[1]
 
         hsv = self._normalize_illumination(bgr_image)
         raw_mask = self._color_mask(hsv, color_name)
         clean_mask = self._clean_mask(raw_mask)
 
         best_contour, circularity = self._select_best_contour(clean_mask)
-        if best_contour is None:
-            return rgb_original, np.zeros_like(rgb_original), np.zeros_like(clean_mask), False
 
-        final_mask = self._build_final_mask(best_contour, circularity, clean_mask.shape)
+        final_mask = None
+        if best_contour is not None:
+            final_mask = self._build_final_mask(best_contour, circularity, clean_mask.shape)
+            mask_area_ratio = cv2.countNonZero(final_mask) / float(frame_area)
+        else:
+            mask_area_ratio = 0.0
+
+        if best_contour is None or mask_area_ratio < self.min_mask_area_ratio:
+            # No contour passed validation, or the detected blob is too
+            # small a fraction of the frame to trust as "the sign" —
+            # fall back to the full resized original instead of cropping.
+            fallback_mask = np.full(clean_mask.shape, 255, dtype=np.uint8)
+            return rgb_original, rgb_original.copy(), fallback_mask, "fallback"
 
         # Feather the mask edge slightly so the crop doesn't have hard
         # jagged boundaries (helps downstream classifiers).
@@ -238,7 +270,7 @@ class TrafficSignSegmenter:
         alpha_3ch = cv2.merge([alpha, alpha, alpha])
         cropped_rgb = (rgb_original.astype(np.float32) * alpha_3ch).astype(np.uint8)
 
-        return rgb_original, cropped_rgb, final_mask, True
+        return rgb_original, cropped_rgb, final_mask, "ok"
 
 
 # ----------------------------------------------------------------------
@@ -259,7 +291,13 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
 
     Returns
     -------
-    list of dicts: {"filename": str, "original": np.ndarray RGB, "cropped": np.ndarray RGB}
+    list of dicts: {"filename": str, "original": np.ndarray RGB,
+                     "cropped": np.ndarray RGB, "status": "ok" | "fallback",
+                     "hog": np.ndarray, "color_histogram": np.ndarray,
+                     "hog_color": np.ndarray}
+        "hog" and "color_histogram" come from feature_extraction_two.py
+        and feature_extraction_one.py respectively (run on the cropped
+        sign), and "hog_color" is their concatenation.
     """
     root_path = Path(root_dir)
     split_path = root_path / split
@@ -298,19 +336,36 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
                     print(f"  Warning: unreadable file skipped -> {img_path.name}")
                     continue
 
-                rgb_original, cropped_rgb, mask, success = segmenter.segment(bgr, color_name)
+                rgb_original, cropped_rgb, mask, status = segmenter.segment(bgr, color_name)
 
-                if success:
-                    save_file = save_dir / img_path.name
-                    cropped_bgr = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(str(save_file), cropped_bgr)
-                else:
-                    print(f"  Warning: no valid sign found -> {img_path.name}")
+                # Both "ok" and "fallback" are saved — a fallback keeps
+                # the sample in the dataset (as the full resized image)
+                # instead of dropping it entirely.
+                save_file = save_dir / img_path.name
+                cropped_bgr = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(save_file), cropped_bgr)
+
+                if status == "fallback":
+                    print(f"  Fallback (mask too small/absent) -> {img_path.name}")
+
+                # Feature extraction runs on the saved cropped image, reusing
+                # feature_extraction_one.py (color histogram) and
+                # feature_extraction_two.py (HOG) rather than duplicating
+                # that logic here.
+                color_hist = feat1.extract_color_histogram(cropped_bgr)
+                hog_vector, _hog_image, _resized = feat2.extract_hog_features(str(save_file))
+                if hog_vector is None:
+                    hog_vector = np.array([])
+                hog_color = np.concatenate([hog_vector, color_hist])
 
                 results.append({
                     "filename": img_path.name,
                     "original": rgb_original,
                     "cropped": cropped_rgb,
+                    "status": status,
+                    "hog": hog_vector,
+                    "color_histogram": color_hist,
+                    "hog_color": hog_color,
                 })
 
                 if show:
