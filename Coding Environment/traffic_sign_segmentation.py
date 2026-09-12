@@ -51,7 +51,7 @@ Usage
     )
     # results is a list of dicts:
     #   {"filename": str, "original": np.ndarray (RGB), "cropped": np.ndarray (RGB),
-    #    "status": "ok" | "fallback",
+    #    "status": "ok" | "fallback", "mask_area_ratio": float,
     #    "hog": np.ndarray, "color_histogram": np.ndarray, "hog_color": np.ndarray}
 """
 
@@ -63,7 +63,6 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
-
 import feature_extraction_one as feat1
 import feature_extraction_two as feat2
 
@@ -74,7 +73,7 @@ COLORS = ["Blue", "Red", "Yellow"]
 class TrafficSignSegmenter:
     """Color + shape based segmenter, robust to lighting and noise."""
 
-    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05):
+    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.20):
         self.resize_to = resize_to
         # If the final mask covers less than this fraction of the frame,
         # the "detected" region is treated as too small/unreliable and we
@@ -224,14 +223,22 @@ class TrafficSignSegmenter:
     def segment(self, bgr_image, color_name):
         """Segment a single BGR image for the given color.
 
-        Returns (rgb_original, cropped_rgb, mask, status) where status is
-        one of:
+        Returns (rgb_original, cropped_rgb, mask, status, mask_area_ratio)
+        where status is one of:
             "ok"       — a reliable sign region was found and cropped
             "fallback" — no reliable region (mask too small / not found);
                          cropped_rgb is the resized ORIGINAL image, and
                          mask is left as an all-white mask of the same
                          size (so downstream code can still treat
                          "cropped" uniformly as "the RGB image to use").
+
+        mask_area_ratio is the fraction of the frame covered by the
+        detected mask BEFORE the fallback decision — i.e. even for a
+        "fallback" result this tells you how close it came (0.0 means no
+        contour passed validation at all, vs. e.g. 0.09 means something
+        was found but was judged too small to trust). This lets you bucket
+        "ok" results by how confident the segmentation actually was,
+        instead of only knowing ok/fallback as a binary.
 
         A fallback is used instead of discarding the image so the sample
         isn't lost from the dataset — it just isn't trimmed down to a
@@ -261,7 +268,7 @@ class TrafficSignSegmenter:
             # small a fraction of the frame to trust as "the sign" —
             # fall back to the full resized original instead of cropping.
             fallback_mask = np.full(clean_mask.shape, 255, dtype=np.uint8)
-            return rgb_original, rgb_original.copy(), fallback_mask, "fallback"
+            return rgb_original, rgb_original.copy(), fallback_mask, "fallback", mask_area_ratio
 
         # Feather the mask edge slightly so the crop doesn't have hard
         # jagged boundaries (helps downstream classifiers).
@@ -270,7 +277,7 @@ class TrafficSignSegmenter:
         alpha_3ch = cv2.merge([alpha, alpha, alpha])
         cropped_rgb = (rgb_original.astype(np.float32) * alpha_3ch).astype(np.uint8)
 
-        return rgb_original, cropped_rgb, final_mask, "ok"
+        return rgb_original, cropped_rgb, final_mask, "ok", mask_area_ratio
 
 
 # ----------------------------------------------------------------------
@@ -293,8 +300,12 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
     -------
     list of dicts: {"filename": str, "original": np.ndarray RGB,
                      "cropped": np.ndarray RGB, "status": "ok" | "fallback",
+                     "mask_area_ratio": float,
                      "hog": np.ndarray, "color_histogram": np.ndarray,
                      "hog_color": np.ndarray}
+        "mask_area_ratio" is the fraction of the frame the detected mask
+        covered BEFORE the fallback decision — useful for bucketing "ok"
+        results by segmentation confidence (see TrafficSignSegmenter.segment).
         "hog" and "color_histogram" come from feature_extraction_two.py
         and feature_extraction_one.py respectively (run on the cropped
         sign), and "hog_color" is their concatenation.
@@ -336,7 +347,7 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
                     print(f"  Warning: unreadable file skipped -> {img_path.name}")
                     continue
 
-                rgb_original, cropped_rgb, mask, status = segmenter.segment(bgr, color_name)
+                rgb_original, cropped_rgb, mask, status, mask_area_ratio = segmenter.segment(bgr, color_name)
 
                 # Both "ok" and "fallback" are saved — a fallback keeps
                 # the sample in the dataset (as the full resized image)
@@ -363,6 +374,7 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
                     "original": rgb_original,
                     "cropped": cropped_rgb,
                     "status": status,
+                    "mask_area_ratio": mask_area_ratio,
                     "hog": hog_vector,
                     "color_histogram": color_hist,
                     "hog_color": hog_color,
