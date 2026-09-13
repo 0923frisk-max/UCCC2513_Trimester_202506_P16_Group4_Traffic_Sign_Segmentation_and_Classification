@@ -93,7 +93,8 @@ COLORS = ["Blue", "Red", "Yellow"]
 class TrafficSignSegmenter:
     """Color + shape based segmenter, robust to lighting and noise."""
 
-    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05, bridge_kernel_size=21):
+    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05, bridge_kernel_size=21,
+                 use_gamma_correction=True, use_lab_color=True, use_bridge_retry=True):
         self.resize_to = resize_to
         # If the final mask covers less than this fraction of the frame,
         # the "detected" region is treated as too small/unreliable and we
@@ -110,6 +111,12 @@ class TrafficSignSegmenter:
         self.kernel_close_bridge = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (bridge_kernel_size, bridge_kernel_size)
         )
+        # Ablation switches -- flip these off one at a time to isolate
+        # which of the three additions is actually helping/hurting on
+        # your real data, instead of always testing all three bundled.
+        self.use_gamma_correction = use_gamma_correction
+        self.use_lab_color = use_lab_color
+        self.use_bridge_retry = use_bridge_retry
 
     # ------------------------------------------------------------------
     # Illumination / noise handling
@@ -145,7 +152,10 @@ class TrafficSignSegmenter:
     def _normalize_illumination(self, bgr_image):
         """Returns (normalized_bgr, hsv) — both are handed to the color
         matching step so it can look at HSV hue AND LAB chrominance."""
-        exposure_corrected = self._auto_gamma_correct(bgr_image)
+        if self.use_gamma_correction:
+            exposure_corrected = self._auto_gamma_correct(bgr_image)
+        else:
+            exposure_corrected = bgr_image
         balanced = self._gray_world_white_balance(exposure_corrected)
 
         # Denoise before anything else: median kills salt-and-pepper /
@@ -189,6 +199,9 @@ class TrafficSignSegmenter:
         hsv_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
         for lower, upper in self._get_hsv_ranges(color_name, hsv_image):
             hsv_mask = cv2.bitwise_or(hsv_mask, cv2.inRange(hsv_image, lower, upper))
+
+        if not self.use_lab_color:
+            return hsv_mask
 
         lab_mask = self._lab_color_mask(bgr_image, color_name)
 
@@ -337,7 +350,7 @@ class TrafficSignSegmenter:
 
         best_contour, circularity = self._select_best_contour(clean_mask)
 
-        if best_contour is None:
+        if best_contour is None and self.use_bridge_retry:
             # No single connected region passed validation -- this is the
             # signature of a border that's fragmented into disconnected
             # arcs (uneven lighting / color inconsistency breaking up a
@@ -377,7 +390,9 @@ class TrafficSignSegmenter:
 # ----------------------------------------------------------------------
 # Dataset-level pipeline
 # ----------------------------------------------------------------------
-def process_dataset(root_dir, split="Train", output_root="cropped", show=True, resize_to=(300, 300)):
+def process_dataset(root_dir, split="Train", output_root="cropped", show=True, resize_to=(300, 300),
+                     min_mask_area_ratio=0.05, use_gamma_correction=True, use_lab_color=False,
+                     use_bridge_retry=True, bridge_kernel_size=21):
     """Walk <root_dir>/<split>/<Color>/<class_id>/*.jpg (etc.), segment
     every image, save every cropped sign into `output_root` (mirroring
     the split/color/class_id structure) and return the results.
@@ -389,6 +404,11 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
     output_root : folder name to save cropped signs into (created if needed)
     show : if True, display original/cropped/mask with matplotlib per image
     resize_to : (w, h) to standardize input images to, or None to keep original size
+    min_mask_area_ratio, use_gamma_correction, use_lab_color, use_bridge_retry,
+    bridge_kernel_size : forwarded to TrafficSignSegmenter — use the three
+        use_* flags to run an ablation (e.g. call this 4x: baseline with
+        all False, then each one True on its own) to see which addition
+        actually helps on your data instead of testing them bundled.
 
     Returns
     -------
@@ -411,7 +431,14 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
     if not split_path.exists():
         raise FileNotFoundError(f"Split folder not found: {split_path}")
 
-    segmenter = TrafficSignSegmenter(resize_to=resize_to)
+    segmenter = TrafficSignSegmenter(
+        resize_to=resize_to,
+        min_mask_area_ratio=min_mask_area_ratio,
+        bridge_kernel_size=bridge_kernel_size,
+        use_gamma_correction=use_gamma_correction,
+        use_lab_color=use_lab_color,
+        use_bridge_retry=use_bridge_retry,
+    )
     results = []
 
     for color_name in COLORS:
@@ -498,7 +525,7 @@ if __name__ == "__main__":
     DATASET_ROOT = "dataset"
     all_results = process_dataset(
         root_dir=DATASET_ROOT,
-        split="Train",
+        split="Test",
         output_root="cropped",
         show=False,
     )
