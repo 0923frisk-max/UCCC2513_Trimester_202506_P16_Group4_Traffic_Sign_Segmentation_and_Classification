@@ -9,6 +9,11 @@ into one reliable pipeline.
 Key reliability improvements over the original scripts
 --------------------------------------------------------
 1. Illumination normalization BEFORE color thresholding:
+   - Automatic gamma correction first normalizes GLOBAL exposure (very
+     bright/overexposed or very dark/underexposed frames), which CLAHE
+     alone does not fix — CLAHE only boosts LOCAL contrast, so a frame
+     that's uniformly too bright or too dark still ends up mis-thresholded
+     without this step.
    - Gray-world auto white balance removes color casts caused by
      tungsten / fluorescent / sodium-vapor lighting, which is the #1
      cause of hue drift in HSV-based color segmentation.
@@ -22,17 +27,32 @@ Key reliability improvements over the original scripts
      saturation more physically consistent before we re-derive HSV).
 2. Median blur (salt-and-pepper noise) + Gaussian blur (sensor noise)
    before threshold, instead of only Gaussian.
-3. HSV ranges were widened/aligned across all three original scripts
+3. Dual colorspace color matching: the HSV threshold is OR-combined with
+   a second mask computed from LAB's a*/b* chrominance channels. HSV hue
+   is very sensitive to exposure/white-balance shifts (a color can drift
+   just outside the tuned range under odd lighting); LAB's chrominance
+   channels are comparatively decoupled from luminance and often still
+   catch a sign the HSV range missed. The extra false positives this
+   invites are filtered out downstream by shape scoring (#5).
+4. Broken-border retry: a sign's colored border (esp. red outlines) can
+   fragment into disconnected arcs under uneven lighting or color
+   inconsistency, so the closed mask ends up as several small blobs
+   instead of one loop. If no contour passes shape validation with the
+   normal closing kernel, the module retries once with a larger
+   "bridging" kernel that merges nearby fragments into a single blob
+   before re-running shape validation — used only as a fallback so it
+   doesn't blur together genuinely separate/well-segmented signs.
+5. HSV ranges were widened/aligned across all three original scripts
    (blue/red/yellow each had two slightly different range sets) and a
    brightness-adaptive lower-V bound is used so dim/underexposed images
    don't lose their sign to the mask.
-4. Morphology + contour selection now scores candidates using area,
+6. Morphology + contour selection now scores candidates using area,
    aspect ratio, solidity AND circularity together (the original
    shape.py only used area/aspect/solidity for the mask, and a crude
    vertex-count check to decide "draw as filled circle vs polygon").
    Scoring instead of hard sequential filtering makes the module far
    less likely to drop a valid sign because of one borderline check.
-5. One shared implementation instead of 3 near-duplicate scripts, so a
+7. One shared implementation instead of 3 near-duplicate scripts, so a
    fix/tune in one place (e.g. HSV ranges) benefits all colors.
 
 Expected dataset layout
@@ -73,7 +93,7 @@ COLORS = ["Blue", "Red", "Yellow"]
 class TrafficSignSegmenter:
     """Color + shape based segmenter, robust to lighting and noise."""
 
-    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.20):
+    def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05, bridge_kernel_size=21):
         self.resize_to = resize_to
         # If the final mask covers less than this fraction of the frame,
         # the "detected" region is treated as too small/unreliable and we
@@ -82,10 +102,35 @@ class TrafficSignSegmenter:
         self.min_mask_area_ratio = min_mask_area_ratio
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        # Used only as a retry when the normal kernel leaves a sign's
+        # border as several disconnected fragments (see segment()). How
+        # large this needs to be depends on the actual gap width in your
+        # images -- tune it up if borders are still coming out fragmented,
+        # down if it's fusing genuinely separate nearby signs together.
+        self.kernel_close_bridge = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (bridge_kernel_size, bridge_kernel_size)
+        )
 
     # ------------------------------------------------------------------
     # Illumination / noise handling
     # ------------------------------------------------------------------
+    def _auto_gamma_correct(self, bgr_image):
+        """Normalize GLOBAL exposure via gamma correction so very bright
+        (overexposed) or very dark (underexposed) frames land closer to
+        mid-gray before anything else runs. CLAHE (applied later) only
+        boosts LOCAL contrast — it does not fix a frame that is uniformly
+        too bright or too dark, which is exactly the "光照太亮太暗" case.
+        """
+        gray_mean = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY).mean() / 255.0
+        gray_mean = float(np.clip(gray_mean, 1e-3, 1 - 1e-3))
+        gamma = math.log(0.5) / math.log(gray_mean)
+        # Clamp so a near-black or near-white frame doesn't get an
+        # extreme correction that amplifies noise instead of exposure.
+        gamma = float(np.clip(gamma, 0.4, 2.5))
+        inv_gamma = 1.0 / gamma
+        table = (np.linspace(0, 1, 256) ** inv_gamma * 255).astype(np.uint8)
+        return cv2.LUT(bgr_image, table)
+
     def _gray_world_white_balance(self, bgr_image):
         """Simple, fast auto white balance to remove color casts."""
         result = bgr_image.astype(np.float32)
@@ -98,7 +143,10 @@ class TrafficSignSegmenter:
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def _normalize_illumination(self, bgr_image):
-        balanced = self._gray_world_white_balance(bgr_image)
+        """Returns (normalized_bgr, hsv) — both are handed to the color
+        matching step so it can look at HSV hue AND LAB chrominance."""
+        exposure_corrected = self._auto_gamma_correct(bgr_image)
+        balanced = self._gray_world_white_balance(exposure_corrected)
 
         # Denoise before anything else: median kills salt-and-pepper /
         # compression speckle, Gaussian softens residual sensor noise.
@@ -113,7 +161,7 @@ class TrafficSignSegmenter:
 
         normalized_bgr = cv2.cvtColor(lab_equalized, cv2.COLOR_LAB2BGR)
         hsv = cv2.cvtColor(normalized_bgr, cv2.COLOR_BGR2HSV)
-        return hsv
+        return normalized_bgr, hsv
 
     # ------------------------------------------------------------------
     # Color thresholding
@@ -137,15 +185,48 @@ class TrafficSignSegmenter:
             ]
         return []
 
-    def _color_mask(self, hsv_image, color_name):
-        mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+    def _color_mask(self, hsv_image, bgr_image, color_name):
+        hsv_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
         for lower, upper in self._get_hsv_ranges(color_name, hsv_image):
-            mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
-        return mask
+            hsv_mask = cv2.bitwise_or(hsv_mask, cv2.inRange(hsv_image, lower, upper))
 
-    def _clean_mask(self, mask):
+        lab_mask = self._lab_color_mask(bgr_image, color_name)
+
+        # OR-combine two independent color spaces: HSV hue can drift just
+        # outside the tuned range under odd lighting/white-balance ("颜色
+        # 没对上"), while LAB's a*/b* chrominance channels are comparatively
+        # decoupled from luminance and often still catch it. The extra
+        # false-positive area this invites gets filtered out downstream by
+        # shape scoring (area/aspect/solidity/circularity).
+        return cv2.bitwise_or(hsv_mask, lab_mask)
+
+    def _lab_color_mask(self, bgr_image, color_name):
+        """Secondary color mask from LAB's a*/b* chrominance channels.
+        LAB separates luminance (L) from color (a*: green-red, b*:
+        blue-yellow), so a sign's chrominance stays comparatively stable
+        even when overall brightness/white-balance shifts — exactly the
+        case where a fixed HSV hue range starts to miss."""
+        lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
+        a_channel, b_channel = lab[:, :, 1], lab[:, :, 2]
+
+        if color_name == "Red":
+            # High a* (red/magenta) combined with a moderately positive
+            # b* excludes pure magenta/pink, keeping it closer to "red".
+            return cv2.inRange(a_channel, 150, 255) & cv2.inRange(b_channel, 120, 255)
+        elif color_name == "Blue":
+            # Blue sits on the low end of both axes: slightly-green-to-
+            # neutral a*, and low (blue-leaning) b*.
+            return cv2.inRange(a_channel, 100, 145) & cv2.inRange(b_channel, 60, 115)
+        elif color_name == "Yellow":
+            # High b* (yellow) with a roughly neutral a* excludes
+            # oranges/reds that also have a high b*.
+            return cv2.inRange(a_channel, 110, 150) & cv2.inRange(b_channel, 150, 255)
+        return np.zeros(bgr_image.shape[:2], dtype=np.uint8)
+
+    def _clean_mask(self, mask, kernel_close=None):
+        kernel_close = self.kernel_close if kernel_close is None else kernel_close
         opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
-        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, self.kernel_close)
+        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close)
         return closed
 
     # ------------------------------------------------------------------
@@ -250,11 +331,24 @@ class TrafficSignSegmenter:
         rgb_original = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
         frame_area = rgb_original.shape[0] * rgb_original.shape[1]
 
-        hsv = self._normalize_illumination(bgr_image)
-        raw_mask = self._color_mask(hsv, color_name)
+        normalized_bgr, hsv = self._normalize_illumination(bgr_image)
+        raw_mask = self._color_mask(hsv, normalized_bgr, color_name)
         clean_mask = self._clean_mask(raw_mask)
 
         best_contour, circularity = self._select_best_contour(clean_mask)
+
+        if best_contour is None:
+            # No single connected region passed validation -- this is the
+            # signature of a border that's fragmented into disconnected
+            # arcs (uneven lighting / color inconsistency breaking up a
+            # thin colored outline). Retry once with a larger "bridging"
+            # closing kernel that merges nearby fragments into one blob
+            # before re-scoring, rather than immediately giving up.
+            bridged_mask = self._clean_mask(raw_mask, kernel_close=self.kernel_close_bridge)
+            bridged_contour, bridged_circularity = self._select_best_contour(bridged_mask)
+            if bridged_contour is not None:
+                clean_mask = bridged_mask
+                best_contour, circularity = bridged_contour, bridged_circularity
 
         final_mask = None
         if best_contour is not None:
