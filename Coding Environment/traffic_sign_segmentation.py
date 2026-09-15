@@ -54,6 +54,32 @@ Key reliability improvements over the original scripts
    less likely to drop a valid sign because of one borderline check.
 7. One shared implementation instead of 3 near-duplicate scripts, so a
    fix/tune in one place (e.g. HSV ranges) benefits all colors.
+8. Glare reconstruction: retroreflective sign material commonly produces
+   a blown-out, near-white/desaturated highlight under direct sun or
+   headlights, which can cut a colored border or fill into two or more
+   disconnected pieces even before any noise/lighting issue. A bright +
+   desaturated "glare" mask is computed and grown INTO from the existing
+   color mask via morphological reconstruction (geodesic dilation), so
+   only glare that actually touches a detected color region gets healed
+   back in -- an unrelated bright patch elsewhere in the frame (sky,
+   oncoming headlights) that never touches the sign is left alone.
+9. Colorless shape/edge fallback: if HSV+LAB both come back with
+   essentially no usable color evidence at all (fog, night, badly faded
+   paint -- "颜色捕捉不到" in the fullest sense), the module falls back to
+   Canny edges + the same area/aspect/solidity/circularity scoring used
+   for color blobs, with an added vertex-count check against the shapes
+   road signs actually come in (triangle/diamond/rect/pentagon/octagon/
+   circle). This is a last resort before giving up entirely, and is
+   reported as its own status ("shape_fallback") so downstream code can
+   tell "found by color" apart from "found by geometry alone".
+10. Real bounding-box crop instead of full-frame black background: the
+    final mask is feathered and alpha-matted, then the OUTPUT IS CROPPED
+    to the mask's bounding box (with a small padding margin) rather than
+    keeping the full resized frame with everything outside the mask
+    painted black. A full-frame black background lets black pixels
+    dominate downstream color-histogram statistics and manufactures a
+    hard artificial edge all around the mask boundary for HOG -- neither
+    reflects the sign itself.
 
 Expected dataset layout
 ------------------------
@@ -70,8 +96,9 @@ Usage
         show=True,
     )
     # results is a list of dicts:
-    #   {"filename": str, "original": np.ndarray (RGB), "cropped": np.ndarray (RGB),
-    #    "status": "ok" | "fallback", "mask_area_ratio": float,
+    #   {"filename": str, "original": np.ndarray (RGB), "cropped": np.ndarray (RGB,
+    #    cropped to the detected sign's bounding box -- NOT full-frame size),
+    #    "status": "ok" | "shape_fallback" | "fallback", "mask_area_ratio": float,
     #    "hog": np.ndarray, "color_histogram": np.ndarray, "hog_color": np.ndarray}
 """
 
@@ -94,7 +121,10 @@ class TrafficSignSegmenter:
     """Color + shape based segmenter, robust to lighting and noise."""
 
     def __init__(self, resize_to=(300, 300), min_mask_area_ratio=0.05, bridge_kernel_size=21,
-                 use_gamma_correction=True, use_lab_color=True, use_bridge_retry=True):
+                 use_gamma_correction=True, use_lab_color=False, use_bridge_retry=True,
+                 use_shape_validation=True, use_glare_reconstruction=True,
+                 use_shape_fallback=False, glare_v_thresh=235, glare_s_thresh=55,
+                 crop_padding_ratio=0.08):
         self.resize_to = resize_to
         # If the final mask covers less than this fraction of the frame,
         # the "detected" region is treated as too small/unreliable and we
@@ -102,7 +132,7 @@ class TrafficSignSegmenter:
         # a crop that is probably noise, not signal.
         self.min_mask_area_ratio = min_mask_area_ratio
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)) # 11 to 31
         # Used only as a retry when the normal kernel leaves a sign's
         # border as several disconnected fragments (see segment()). How
         # large this needs to be depends on the actual gap width in your
@@ -111,12 +141,39 @@ class TrafficSignSegmenter:
         self.kernel_close_bridge = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (bridge_kernel_size, bridge_kernel_size)
         )
+        # Single dilation step used to grow the color mask into adjacent
+        # glare pixels one ring at a time (see _reconstruct_through_glare).
+        # Kept small and applied iteratively so growth stays confined to
+        # pixels that are actually glare, instead of one big blunt dilation
+        # that would also swallow nearby background. MUST be 8-connected
+        # (full 3x3 square, not a plus-shaped ellipse/cross): two
+        # hard-edged color regions rendered next to each other very often
+        # meet only at a single diagonal pixel (a rasterization seam), and
+        # a 4-connected kernel can never cross a pure diagonal gap no
+        # matter how many iterations it's given.
+        self.kernel_glare_grow = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
         # Ablation switches -- flip these off one at a time to isolate
-        # which of the three additions is actually helping/hurting on
-        # your real data, instead of always testing all three bundled.
+        # which addition is actually helping/hurting on your real data,
+        # instead of always testing everything bundled.
         self.use_gamma_correction = use_gamma_correction
         self.use_lab_color = use_lab_color
         self.use_bridge_retry = use_bridge_retry
+        self.use_shape_validation = use_shape_validation
+        self.use_glare_reconstruction = use_glare_reconstruction
+        self.use_shape_fallback = use_shape_fallback
+
+        # A pixel counts as "glare" when it's both very bright (V) and
+        # near-colorless (low S) -- the signature of a blown-out highlight
+        # on reflective sign material, as opposed to a saturated patch of
+        # the sign's actual color.
+        self.glare_v_thresh = glare_v_thresh
+        self.glare_s_thresh = glare_s_thresh
+
+        # Extra margin (fraction of the bbox's own width/height) kept
+        # around the detected sign when cropping to its bounding box, so
+        # the crop doesn't shave off a sliver of the actual border.
+        self.crop_padding_ratio = crop_padding_ratio
 
     # ------------------------------------------------------------------
     # Illumination / noise handling
@@ -130,12 +187,21 @@ class TrafficSignSegmenter:
         """
         gray_mean = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY).mean() / 255.0
         gray_mean = float(np.clip(gray_mean, 1e-3, 1 - 1e-3))
-        gamma = math.log(0.5) / math.log(gray_mean)
+        # Solve for the exponent that maps the frame's current mean
+        # brightness to mid-gray: gray_mean ** exponent == 0.5.
+        # (Applying its reciprocal here, as an earlier version of this
+        # function did, pushes brightness AWAY from mid-gray instead of
+        # toward it -- it makes dark frames darker and bright frames
+        # brighter, i.e. the exact opposite of what "gamma correction for
+        # exposure" is supposed to do. Verified against gray_mean=0.089
+        # and 0.9: the reciprocal moves them to 0.002 and 0.959
+        # respectively, while applying the exponent directly moves them
+        # to 0.379 and 0.768 -- correctly toward 0.5.)
+        exponent = math.log(0.5) / math.log(gray_mean)
         # Clamp so a near-black or near-white frame doesn't get an
         # extreme correction that amplifies noise instead of exposure.
-        gamma = float(np.clip(gamma, 0.4, 2.5))
-        inv_gamma = 1.0 / gamma
-        table = (np.linspace(0, 1, 256) ** inv_gamma * 255).astype(np.uint8)
+        exponent = float(np.clip(exponent, 0.4, 2.5))
+        table = (np.linspace(0, 1, 256) ** exponent * 255).astype(np.uint8)
         return cv2.LUT(bgr_image, table)
 
     def _gray_world_white_balance(self, bgr_image):
@@ -160,7 +226,7 @@ class TrafficSignSegmenter:
 
         # Denoise before anything else: median kills salt-and-pepper /
         # compression speckle, Gaussian softens residual sensor noise.
-        denoised = cv2.medianBlur(balanced, 3)
+        denoised = cv2.medianBlur(balanced, 1)
         denoised = cv2.GaussianBlur(denoised, (3, 3), 0)
 
         lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
@@ -182,16 +248,16 @@ class TrafficSignSegmenter:
         (shadowed / backlit) signs aren't lost."""
         mean_v = hsv_image[:, :, 2].mean()
         # In a dark scene, relax the minimum value/brightness we accept
-        v_floor = 30 if mean_v < 90 else 45
+        v_floor = 40 if mean_v < 100 else 55 #30 to 40, 90 to 100,  45 to 55
 
-        if color_name == "Blue":
-            return [(np.array([95, 60, v_floor]), np.array([135, 255, 255]))]
+        if color_name == "Blue": #95 to 100
+            return [(np.array([100, 120, v_floor]), np.array([135, 255, 255]))]
         elif color_name == "Yellow":
-            return [(np.array([12, 70, v_floor]), np.array([34, 255, 255]))]
+            return [(np.array([10, 77, v_floor]), np.array([34, 255, 255]))]
         elif color_name == "Red":
             return [
-                (np.array([0, 70, v_floor]), np.array([10, 255, 255])),
-                (np.array([165, 70, v_floor]), np.array([180, 255, 255])),
+                (np.array([0, 80, v_floor]), np.array([10, 255, 255])),
+                (np.array([165, 80, v_floor]), np.array([180, 255, 255])),
             ]
         return []
 
@@ -236,6 +302,47 @@ class TrafficSignSegmenter:
             return cv2.inRange(a_channel, 110, 150) & cv2.inRange(b_channel, 150, 255)
         return np.zeros(bgr_image.shape[:2], dtype=np.uint8)
 
+    # ------------------------------------------------------------------
+    # Glare (blown-highlight) reconstruction
+    # ------------------------------------------------------------------
+    def _detect_glare_mask(self, hsv_image):
+        """Near-white blown-out highlight pixels: very bright AND
+        desaturated. Retroreflective sign material commonly produces
+        exactly this under direct headlight/sunlight glare, which can cut
+        a colored border or split a filled region into disconnected
+        pieces -- independent of any exposure/noise issue elsewhere."""
+        v_channel = hsv_image[:, :, 2]
+        s_channel = hsv_image[:, :, 1]
+        bright = cv2.inRange(v_channel, self.glare_v_thresh, 255)
+        desaturated = cv2.inRange(s_channel, 0, self.glare_s_thresh)
+        return cv2.bitwise_and(bright, desaturated)
+
+    def _reconstruct_through_glare(self, raw_mask, hsv_image, max_iterations=40):
+        """Heals holes/breaks in the color mask caused by glare, via
+        morphological reconstruction by dilation: grow the color mask one
+        small ring at a time, but only into pixels that are both (a)
+        glare and (b) reachable from an already-detected color pixel.
+        An isolated bright patch elsewhere in the frame (sky, oncoming
+        headlights) never touches the color mask, so it is never pulled
+        in -- this only closes gaps that sit on/inside the sign itself.
+        """
+        if not self.use_glare_reconstruction:
+            return raw_mask
+
+        glare_mask = self._detect_glare_mask(hsv_image)
+        if cv2.countNonZero(glare_mask) == 0:
+            return raw_mask
+
+        ceiling = cv2.bitwise_or(raw_mask, glare_mask)
+        marker = raw_mask.copy()
+        for _ in range(max_iterations):
+            grown = cv2.dilate(marker, self.kernel_glare_grow, iterations=1)
+            grown = cv2.bitwise_and(grown, ceiling)
+            if cv2.countNonZero(cv2.bitwise_xor(grown, marker)) == 0:
+                break
+            marker = grown
+        return marker
+
     def _clean_mask(self, mask, kernel_close=None):
         kernel_close = self.kernel_close if kernel_close is None else kernel_close
         opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel_open)
@@ -274,6 +381,29 @@ class TrafficSignSegmenter:
         score = area * (0.5 + 0.3 * solidity + 0.2 * min(circularity, 1.0))
         return score, contour, circularity
 
+    def _select_largest_contour_raw(self, mask, min_area=200):
+        """No-shape-validation path: just the largest contour above a
+        noise floor, with no aspect-ratio/solidity/circularity filtering
+        at all. Used when use_shape_validation=False, so you can test
+        whether the geometric filtering is actually helping or just
+        rejecting/distorting otherwise-fine color detections."""
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < min_area:
+            return None
+        return largest
+
+    def _build_final_mask_raw(self, contour, mask_shape):
+        """No-shape-validation path: fill the contour exactly as detected
+        -- no approxPolyDP simplification, no forcing round signs into a
+        reconstructed circle. This keeps whatever the color mask actually
+        found, jagged edges and all."""
+        final_mask = np.zeros(mask_shape, dtype=np.uint8)
+        cv2.drawContours(final_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        return final_mask
+
     def _select_best_contour(self, mask):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -311,6 +441,100 @@ class TrafficSignSegmenter:
         cv2.drawContours(final_mask, [approx], -1, 255, thickness=cv2.FILLED)
         return final_mask
 
+    def _edge_shape_mask_and_contour(self, bgr_image):
+        """Colorless last resort: when HSV+LAB both come back with
+        essentially no usable color evidence (fog, night, badly faded
+        paint), fall back to pure geometry -- Canny edges closed into
+        blobs, scored with the same area/aspect/solidity/circularity
+        rubric as the color path, plus a vertex-count check against the
+        small set of shapes road signs actually come in. This trades
+        some false-positive risk (no color prior at all) for not losing
+        the sample outright, so it demands a stricter solidity than the
+        color-based path to compensate.
+        """
+        gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 40, 120)
+        edges = cv2.dilate(edges, self.kernel_open, iterations=1)
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, self.kernel_close_bridge)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, None
+
+        image_area = gray.shape[0] * gray.shape[1]
+        candidates = []
+        for contour in contours:
+            scored = self._score_contour(contour, image_area)
+            if scored is None:
+                continue
+            score, contour, circularity = scored
+
+            epsilon = 0.03 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            # Road signs are triangles, quads (rect/diamond), pentagons,
+            # octagons, or circles. Reject anything else that only
+            # cleared area/aspect/solidity by luck.
+            is_plausible_sign_shape = len(approx) in (3, 4, 5, 6, 7, 8) or circularity > 0.7
+            if not is_plausible_sign_shape:
+                continue
+
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = cv2.contourArea(contour) / hull_area if hull_area > 0 else 0.0
+            # No color evidence at all here, so require a cleaner outline
+            # than the color-assisted path (0.35) before trusting it.
+            if solidity < 0.55:
+                continue
+
+            candidates.append((score, contour, circularity))
+
+        if not candidates:
+            return None, None
+
+        best_score, best_contour, best_circularity = max(candidates, key=lambda t: t[0])
+        return best_contour, best_circularity
+
+    def _find_contour(self, mask):
+        """Dispatches to the shape-validated or raw contour selection
+        depending on use_shape_validation."""
+        if self.use_shape_validation:
+            return self._select_best_contour(mask)
+        contour = self._select_largest_contour_raw(mask)
+        return contour, None
+
+    def _build_mask(self, contour, circularity, mask_shape):
+        """Dispatches to the shape-validated (polygon/circle
+        reconstruction) or raw (fill contour as-is) mask builder."""
+        if self.use_shape_validation:
+            return self._build_final_mask(contour, circularity, mask_shape)
+        return self._build_final_mask_raw(contour, mask_shape)
+
+    def _crop_to_bbox(self, rgb_image, mask):
+        """Crop to the mask's bounding box (plus a small padding margin)
+        instead of keeping the full frame with everything outside the
+        mask painted black. A full-frame black background lets the black
+        area dominate downstream color-histogram statistics and
+        manufactures a hard artificial edge all around the mask boundary
+        for HOG -- neither reflects the sign itself.
+        """
+        ys, xs = np.where(mask > 0)
+        if ys.size == 0 or xs.size == 0:
+            return rgb_image, mask
+
+        h, w = mask.shape[:2]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+
+        pad_x = int((x1 - x0 + 1) * self.crop_padding_ratio)
+        pad_y = int((y1 - y0 + 1) * self.crop_padding_ratio)
+        x0 = max(0, x0 - pad_x)
+        y0 = max(0, y0 - pad_y)
+        x1 = min(w - 1, x1 + pad_x)
+        y1 = min(h - 1, y1 + pad_y)
+
+        return rgb_image[y0:y1 + 1, x0:x1 + 1], mask[y0:y1 + 1, x0:x1 + 1]
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -319,36 +543,53 @@ class TrafficSignSegmenter:
 
         Returns (rgb_original, cropped_rgb, mask, status, mask_area_ratio)
         where status is one of:
-            "ok"       — a reliable sign region was found and cropped
-            "fallback" — no reliable region (mask too small / not found);
-                         cropped_rgb is the resized ORIGINAL image, and
-                         mask is left as an all-white mask of the same
-                         size (so downstream code can still treat
-                         "cropped" uniformly as "the RGB image to use").
+            "ok"             — a reliable sign region was found by color
+                                and cropped to its bounding box.
+            "shape_fallback" — color evidence was essentially absent, but
+                                a plausible sign shape was still found via
+                                Canny edges + geometric scoring alone;
+                                cropped to that region's bounding box.
+            "fallback"       — nothing usable was found at all (mask too
+                                small / absent even after every retry);
+                                cropped_rgb is the resized ORIGINAL image
+                                (full frame, uncropped) and mask is an
+                                all-white mask of the same size (so
+                                downstream code can still treat "cropped"
+                                uniformly as "the RGB image to use").
 
-        mask_area_ratio is the fraction of the frame covered by the
-        detected mask BEFORE the fallback decision — i.e. even for a
-        "fallback" result this tells you how close it came (0.0 means no
-        contour passed validation at all, vs. e.g. 0.09 means something
-        was found but was judged too small to trust). This lets you bucket
-        "ok" results by how confident the segmentation actually was,
-        instead of only knowing ok/fallback as a binary.
+        For "ok"/"shape_fallback", cropped_rgb and mask are sized to the
+        detected sign's bounding box (plus a small padding margin) rather
+        than the full frame — the region outside the mask is alpha-
+        feathered, not painted black and kept at full-frame size, so it
+        doesn't skew downstream color-histogram/HOG features.
 
-        A fallback is used instead of discarding the image so the sample
-        isn't lost from the dataset — it just isn't trimmed down to a
-        (likely wrong) tiny region.
+        mask_area_ratio is the fraction of the full frame covered by the
+        detected mask BEFORE the fallback decision and BEFORE cropping —
+        i.e. even for a "fallback" result this tells you how close it
+        came (0.0 means nothing passed validation at all, vs. e.g. 0.09
+        means something was found but was judged too small to trust).
+        This lets you bucket results by how confident the segmentation
+        actually was, instead of only knowing status as a category.
+
+        A "fallback" is used instead of discarding the image so the
+        sample isn't lost from the dataset — it just isn't trimmed down
+        to a (likely wrong) tiny region.
         """
         if self.resize_to is not None:
             bgr_image = cv2.resize(bgr_image, self.resize_to)
 
         rgb_original = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        frame_area = rgb_original.shape[0] * rgb_original.shape[1]
+        frame_shape = rgb_original.shape[:2]
+        frame_area = frame_shape[0] * frame_shape[1]
 
         normalized_bgr, hsv = self._normalize_illumination(bgr_image)
         raw_mask = self._color_mask(hsv, normalized_bgr, color_name)
+        # Heal glare-induced holes/breaks (see _reconstruct_through_glare)
+        # before the normal closing/contour pipeline ever runs.
+        raw_mask = self._reconstruct_through_glare(raw_mask, hsv)
         clean_mask = self._clean_mask(raw_mask)
 
-        best_contour, circularity = self._select_best_contour(clean_mask)
+        best_contour, circularity = self._find_contour(clean_mask)
 
         if best_contour is None and self.use_bridge_retry:
             # No single connected region passed validation -- this is the
@@ -358,14 +599,24 @@ class TrafficSignSegmenter:
             # closing kernel that merges nearby fragments into one blob
             # before re-scoring, rather than immediately giving up.
             bridged_mask = self._clean_mask(raw_mask, kernel_close=self.kernel_close_bridge)
-            bridged_contour, bridged_circularity = self._select_best_contour(bridged_mask)
+            bridged_contour, bridged_circularity = self._find_contour(bridged_mask)
             if bridged_contour is not None:
                 clean_mask = bridged_mask
                 best_contour, circularity = bridged_contour, bridged_circularity
 
+        status = "ok"
+        if best_contour is None and self.use_shape_fallback:
+            # Color evidence is essentially absent (fog/night/faded
+            # paint) -- try pure edge/shape geometry as a last resort
+            # before giving up on the sample entirely.
+            shape_contour, shape_circularity = self._edge_shape_mask_and_contour(normalized_bgr)
+            if shape_contour is not None:
+                best_contour, circularity = shape_contour, shape_circularity
+                status = "shape_fallback"
+
         final_mask = None
         if best_contour is not None:
-            final_mask = self._build_final_mask(best_contour, circularity, clean_mask.shape)
+            final_mask = self._build_mask(best_contour, circularity, frame_shape)
             mask_area_ratio = cv2.countNonZero(final_mask) / float(frame_area)
         else:
             mask_area_ratio = 0.0
@@ -374,25 +625,30 @@ class TrafficSignSegmenter:
             # No contour passed validation, or the detected blob is too
             # small a fraction of the frame to trust as "the sign" —
             # fall back to the full resized original instead of cropping.
-            fallback_mask = np.full(clean_mask.shape, 255, dtype=np.uint8)
+            fallback_mask = np.full(frame_shape, 255, dtype=np.uint8)
             return rgb_original, rgb_original.copy(), fallback_mask, "fallback", mask_area_ratio
 
         # Feather the mask edge slightly so the crop doesn't have hard
-        # jagged boundaries (helps downstream classifiers).
-        feathered = cv2.GaussianBlur(final_mask, (5, 5), 0)
+        # jagged boundaries (helps downstream classifiers), THEN crop to
+        # the mask's bounding box instead of keeping full-frame black.
+        feathered = cv2.GaussianBlur(final_mask, (3, 3), 0)
         alpha = (feathered.astype(np.float32) / 255.0)
         alpha_3ch = cv2.merge([alpha, alpha, alpha])
-        cropped_rgb = (rgb_original.astype(np.float32) * alpha_3ch).astype(np.uint8)
+        matted_full = (rgb_original.astype(np.float32) * alpha_3ch).astype(np.uint8)
 
-        return rgb_original, cropped_rgb, final_mask, "ok", mask_area_ratio
+        cropped_rgb, cropped_mask = self._crop_to_bbox(matted_full, final_mask)
+
+        return rgb_original, cropped_rgb, cropped_mask, status, mask_area_ratio
 
 
 # ----------------------------------------------------------------------
 # Dataset-level pipeline
 # ----------------------------------------------------------------------
 def process_dataset(root_dir, split="Train", output_root="cropped", show=True, resize_to=(300, 300),
-                     min_mask_area_ratio=0.05, use_gamma_correction=True, use_lab_color=False,
-                     use_bridge_retry=True, bridge_kernel_size=21):
+                     min_mask_area_ratio=0.05, use_gamma_correction=True, use_lab_color=True,
+                     use_bridge_retry=True, use_shape_validation=True, bridge_kernel_size=21,
+                     use_glare_reconstruction=True, use_shape_fallback=True,
+                     glare_v_thresh=235, glare_s_thresh=55, crop_padding_ratio=0.08):
     """Walk <root_dir>/<split>/<Color>/<class_id>/*.jpg (etc.), segment
     every image, save every cropped sign into `output_root` (mirroring
     the split/color/class_id structure) and return the results.
@@ -405,15 +661,23 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
     show : if True, display original/cropped/mask with matplotlib per image
     resize_to : (w, h) to standardize input images to, or None to keep original size
     min_mask_area_ratio, use_gamma_correction, use_lab_color, use_bridge_retry,
-    bridge_kernel_size : forwarded to TrafficSignSegmenter — use the three
-        use_* flags to run an ablation (e.g. call this 4x: baseline with
-        all False, then each one True on its own) to see which addition
-        actually helps on your data instead of testing them bundled.
+    use_shape_validation, bridge_kernel_size, use_glare_reconstruction,
+    use_shape_fallback, glare_v_thresh, glare_s_thresh, crop_padding_ratio :
+        forwarded to TrafficSignSegmenter.
+        use_shape_validation=False skips the aspect-ratio/solidity/
+        circularity filtering AND the polygon/circle reconstruction --
+        the largest color-matched blob is used as-is. Use the use_*
+        flags to run an ablation (toggle one at a time) to see which
+        addition actually helps on your data instead of testing them
+        bundled.
 
     Returns
     -------
     list of dicts: {"filename": str, "original": np.ndarray RGB,
-                     "cropped": np.ndarray RGB, "status": "ok" | "fallback",
+                     "cropped": np.ndarray RGB (cropped to the detected
+                     sign's bounding box, NOT full-frame size, except for
+                     "fallback" results which stay full-frame),
+                     "status": "ok" | "shape_fallback" | "fallback",
                      "mask_area_ratio": float,
                      "hog": np.ndarray, "color_histogram": np.ndarray,
                      "hog_color": np.ndarray}
@@ -438,6 +702,12 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
         use_gamma_correction=use_gamma_correction,
         use_lab_color=use_lab_color,
         use_bridge_retry=use_bridge_retry,
+        use_shape_validation=use_shape_validation,
+        use_glare_reconstruction=use_glare_reconstruction,
+        use_shape_fallback=use_shape_fallback,
+        glare_v_thresh=glare_v_thresh,
+        glare_s_thresh=glare_s_thresh,
+        crop_padding_ratio=crop_padding_ratio,
     )
     results = []
 
@@ -479,6 +749,8 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
 
                 if status == "fallback":
                     print(f"  Fallback (mask too small/absent) -> {img_path.name}")
+                elif status == "shape_fallback":
+                    print(f"  Shape-only fallback (no usable color evidence) -> {img_path.name}")
 
                 # Feature extraction runs on the saved cropped image, reusing
                 # feature_extraction_one.py (color histogram) and
@@ -523,6 +795,13 @@ def process_dataset(root_dir, split="Train", output_root="cropped", show=True, r
 if __name__ == "__main__":
     # Example usage — adjust root_dir to your dataset location.
     DATASET_ROOT = "dataset"
+    all_results = process_dataset(
+        root_dir=DATASET_ROOT,
+        split="Train",
+        output_root="cropped",
+        show=False,
+    )
+
     all_results = process_dataset(
         root_dir=DATASET_ROOT,
         split="Test",
