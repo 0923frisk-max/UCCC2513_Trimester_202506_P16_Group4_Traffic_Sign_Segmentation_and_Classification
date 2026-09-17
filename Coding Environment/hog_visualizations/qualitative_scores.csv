@@ -1,0 +1,31 @@
+image_number,filename,verdict,reason
+1,00000.png,Acceptable,outer ring and internal digits both clearly traceable
+2,00001.png,Acceptable,outer ring and internal digits both clearly traceable
+3,00002.png,Acceptable,outer ring and internal digits both clearly traceable
+4,00003.png,Degraded,"blue arrow, cluttered orange-green background produces gradients as strong as the sign"
+5,00005.png,Acceptable,outer ring and internal digits both clearly traceable
+6,00006.png,Acceptable,outer ring and internal digits both clearly traceable
+7,00007.png,Borderline,dark diamond signs where the outline is faint and vertical pole/background bars dominate
+8,00008.png,Degraded,autumn background clutter
+9,00009.png,Acceptable,outer ring and internal digits both clearly traceable
+10,00010.png,Borderline,dark diamond signs where the outline is faint and vertical pole/background bars dominate
+11,00011.png,Acceptable,outer ring and internal digits both clearly traceable
+12,00013.png,Acceptable,outer ring and internal digits both clearly traceable
+13,00014.png,Acceptable,outer ring and internal digits both clearly traceable
+14,00015.png,Acceptable,outer ring and internal digits both clearly traceable
+15,00016.png,Degraded,"triangle against foliage, plus a second sign intruding at the bottom"
+16,00017.png,Acceptable,outer ring and internal digits both clearly traceable
+17,00018.png,Borderline,motion blur softening the pictogram
+18,00019.png,Degraded,sun glare washing out the left half
+19,00020.png,Borderline,motion blur softening the pictogram
+20,00021.png,Acceptable,outer ring and internal digits both clearly traceable
+21,00022.png,Acceptable,outer ring and internal digits both clearly traceable
+22,00023.png,Acceptable,outer ring and internal digits both clearly traceable
+23,00024.png,Acceptable,outer ring and internal digits both clearly traceable
+24,00026.png,Acceptable,outer ring and internal digits both clearly traceable
+25,00028.png,Acceptable,outer ring and internal digits both clearly traceable
+26,00030.png,Acceptable,outer ring and internal digits both clearly traceable
+27,00031.png,Borderline,very low contrast
+28,00032.png,Acceptable,outer ring and internal digits both clearly traceable
+29,00034.png,Acceptable,outer ring and internal digits both clearly traceable
+30,00035.png,Acceptable,outer ring and internal digits both clearly traceable
